@@ -1,0 +1,27 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+tfplan
+*.tfplan
+plan.txt
+
+# Provider lock files are committed so everyone resolves the same versions.
+!.terraform.lock.hcl
+
+# Local environment file, created from .env.example
+.env
+
+# Database dumps
+backups/*
+!backups/.gitkeep
+
+# OS and editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

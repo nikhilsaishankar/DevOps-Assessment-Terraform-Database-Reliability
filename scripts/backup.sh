@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+#
+# Create a timestamped dump of the local database.
+#
+#   ./scripts/backup.sh                 # dump the configured database
+#   ./scripts/backup.sh --format plain  # plain SQL instead of custom format
+#   ./scripts/backup.sh --keep 3        # prune to the 3 most recent dumps
+#   ./scripts/backup.sh --help
+#
+# Output lands in backups/ as:
+#
+#   hotels_20261119_143512.dump         the dump itself
+#   hotels_20261119_143512.dump.sha256  checksum, verified by restore.sh
+#   latest.dump                         symlink to the newest dump
+#
+# The dump is taken with pg_dump inside the container, so no PostgreSQL client
+# needs to be installed on the host.
+
+set -euo pipefail
+
+# shellcheck source=lib/common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
+
+FORMAT="custom"
+KEEP="${BACKUP_RETENTION}"
+LABEL=""
+
+usage() {
+  sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
+  cat <<'USAGE'
+Options:
+  --format custom|plain   Dump format. custom (default) is compressed and is
+                          what pg_restore needs for selective or parallel
+                          restores. plain is a readable .sql file.
+  --keep N                Keep the N most recent dumps, delete older ones.
+                          Default comes from BACKUP_RETENTION (.env).
+  --label TEXT            Extra tag in the filename, e.g. --label pre-migration.
+  -h, --help              Show this help.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --format) FORMAT="${2:?--format needs a value}"; shift 2 ;;
+    --keep)   KEEP="${2:?--keep needs a value}"; shift 2 ;;
+    --label)  LABEL="${2:?--label needs a value}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1 (try --help)" ;;
+  esac
+done
+
+case "${FORMAT}" in
+  custom) PG_FORMAT="c"; EXT="dump" ;;
+  plain)  PG_FORMAT="p"; EXT="sql" ;;
+  *) die "--format must be 'custom' or 'plain', got '${FORMAT}'" ;;
+esac
+
+case "${KEEP}" in
+  ''|*[!0-9]*) die "--keep must be a non-negative integer, got '${KEEP}'" ;;
+esac
+
+require_db_running
+wait_for_db 120
+
+mkdir -p "${BACKUP_PATH}"
+
+TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
+if [ -n "${LABEL}" ]; then
+  # Keep the filename shell- and filesystem-safe.
+  SAFE_LABEL="$(printf '%s' "${LABEL}" | tr -cs '[:alnum:]._-' '-' | sed 's/-\{1,\}$//')"
+  BASENAME="${POSTGRES_DB}_${TIMESTAMP}_${SAFE_LABEL}"
+else
+  BASENAME="${POSTGRES_DB}_${TIMESTAMP}"
+fi
+
+TARGET="${BACKUP_PATH}/${BASENAME}.${EXT}"
+TMP_TARGET="${TARGET}.partial"
+
+log "backing up database '${POSTGRES_DB}' (${FORMAT} format)"
+detail "destination: ${TARGET}"
+
+# Record what we are about to dump, so the restore can be checked against it.
+SRC_BOOKINGS="$(psql_scalar "${POSTGRES_DB}" 'SELECT COUNT(*) FROM hotel_bookings')"
+SRC_EVENTS="$(psql_scalar "${POSTGRES_DB}" 'SELECT COUNT(*) FROM booking_events')"
+detail "source rows: hotel_bookings=${SRC_BOOKINGS} booking_events=${SRC_EVENTS}"
+
+# Write to a .partial file first and move it into place only on success, so an
+# interrupted run never leaves a truncated dump that looks restorable.
+# A failure here trips `set -e` and the trap removes the partial file.
+cleanup_partial() {
+  rm -f "${TMP_TARGET}" "${TMP_TARGET}.log" 2>/dev/null || true
+}
+trap cleanup_partial EXIT
+
+db_exec env PGPASSWORD="${POSTGRES_PASSWORD}" \
+  pg_dump \
+    -U "${POSTGRES_USER}" \
+    -d "${POSTGRES_DB}" \
+    --format="${PG_FORMAT}" \
+    --no-owner \
+    --no-privileges \
+    --verbose \
+  > "${TMP_TARGET}" 2>"${TMP_TARGET}.log" \
+  || {
+    err "pg_dump failed; last lines of its output:"
+    tail -20 "${TMP_TARGET}.log" >&2 || true
+    rm -f "${TMP_TARGET}.log"
+    exit 1
+  }
+
+rm -f "${TMP_TARGET}.log"
+
+# A zero-length dump is a failure even if pg_dump exited 0.
+if [ ! -s "${TMP_TARGET}" ]; then
+  die "pg_dump produced an empty file"
+fi
+
+mv "${TMP_TARGET}" "${TARGET}"
+trap - EXIT
+
+# For the custom format, confirm the archive's table of contents is readable.
+# This catches a corrupted or truncated archive now rather than during an
+# emergency restore.
+if [ "${FORMAT}" = "custom" ]; then
+  if db_exec pg_restore --list < "${TARGET}" > /dev/null 2>&1; then
+    ok "archive table of contents is readable"
+  else
+    die "the dump was written but pg_restore cannot read its table of contents: ${TARGET}"
+  fi
+fi
+
+CHECKSUM="$(sha256_of "${TARGET}")"
+printf '%s  %s\n' "${CHECKSUM}" "$(basename "${TARGET}")" > "${TARGET}.sha256"
+
+# Convenience pointer so restore.sh can be run with no arguments.
+( cd "${BACKUP_PATH}" && ln -sf "$(basename "${TARGET}")" "latest.${EXT}" )
+
+ok "backup complete"
+detail "file     : ${TARGET}"
+detail "size     : $(human_size "${TARGET}")"
+detail "sha256   : ${CHECKSUM}"
+detail "latest   : ${BACKUP_PATH}/latest.${EXT}"
+
+# --- retention ----------------------------------------------------------------
+
+if [ "${KEEP}" -gt 0 ]; then
+  # Newest first, skip the ones we are keeping, delete the rest along with
+  # their checksum files. `ls -t` is safe here because the filenames are
+  # generated by this script and contain no newlines.
+  OLD="$(ls -t "${BACKUP_PATH}"/*."${EXT}" 2>/dev/null | grep -v "/latest.${EXT}$" | tail -n "+$((KEEP + 1))" || true)"
+
+  if [ -n "${OLD}" ]; then
+    COUNT="$(printf '%s\n' "${OLD}" | wc -l | tr -d '[:space:]')"
+    log "pruning ${COUNT} dump(s) beyond the ${KEEP} most recent"
+    printf '%s\n' "${OLD}" | while IFS= read -r f; do
+      [ -z "${f}" ] && continue
+      detail "removing $(basename "${f}")"
+      rm -f "${f}" "${f}.sha256"
+    done
+  fi
+fi
+
+REMAINING="$(ls -1 "${BACKUP_PATH}"/*."${EXT}" 2>/dev/null | grep -v "/latest.${EXT}$" | wc -l | tr -d '[:space:]')"
+detail "dumps retained: ${REMAINING}"

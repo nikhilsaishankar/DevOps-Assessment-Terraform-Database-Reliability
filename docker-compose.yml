@@ -1,0 +1,68 @@
+# Local PostgreSQL for the database half of the assessment.
+#
+#   docker compose up -d
+#
+# On first start, and only while the data volume is empty, the official image
+# runs everything mounted into /docker-entrypoint-initdb.d in filename order.
+# The numeric prefixes are what guarantee that order: schema (0001, 0002),
+# then indexes (0003), then seed data (0100).
+#
+# Each file is mounted individually rather than mounting the db/ directory,
+# because the entrypoint only executes files at the top level of
+# /docker-entrypoint-initdb.d and would ignore nested db/migrations/ and
+# db/seed/ subdirectories.
+#
+# To re-run initialisation from scratch:  docker compose down -v && docker compose up -d
+
+name: hotelbook
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: hotelbook-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hotels}
+      POSTGRES_USER: ${POSTGRES_USER:-hotels_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdev_only_not_a_real_secret}
+      # Pinned to UTC so that NOW(), the seed's created_at values and the
+      # 30-day window in the target query mean the same thing regardless of
+      # the host's timezone.
+      TZ: UTC
+      PGTZ: UTC
+      # Slightly stronger than the image default, and matches rds.force_ssl
+      # intent in the Terraform parameter group.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+
+    ports:
+      # Published so psql on the host can reach it too, but every script in
+      # scripts/ goes through `docker compose exec` and needs no host client.
+      - "${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations/0001_create_hotel_bookings.sql:/docker-entrypoint-initdb.d/0001_create_hotel_bookings.sql:ro
+      - ./db/migrations/0002_create_booking_events.sql:/docker-entrypoint-initdb.d/0002_create_booking_events.sql:ro
+      - ./db/migrations/0003_indexes.sql:/docker-entrypoint-initdb.d/0003_indexes.sql:ro
+      - ./db/seed/0100_seed.sql:/docker-entrypoint-initdb.d/0100_seed.sql:ro
+      # Query files, available inside the container for ad-hoc psql -f runs.
+      - ./db/queries:/queries:ro
+
+    healthcheck:
+      # Scoped to the user and database, so the check only passes once the
+      # entrypoint has finished initialisation, not merely when the postmaster
+      # is listening. Every script waits on this.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hotels_admin} -d ${POSTGRES_DB:-hotels} -q"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+    # Postgres is happier with more than the 64MB of /dev/shm Docker gives a
+    # container by default once queries start using parallel workers.
+    shm_size: 256mb
+
+volumes:
+  pgdata:
+    name: hotelbook-pgdata
